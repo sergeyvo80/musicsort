@@ -15,3 +15,14 @@ organized/
 
 # Claude Code / agentic tooling state
 .agentic/
+.claude/
+
+# CLAP genre classifier: embedding cache, trained head, and hand-labeled
+# CSVs are machine/library-specific artifacts, not source
+.clap_cache.pkl
+clap_genre_head.joblib
+labels_template.csv
+labels*.csv
+
+# CLAP model checkpoint download cache (laion_clap default location)
+.cache/

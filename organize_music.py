@@ -2,18 +2,24 @@
 """
 Organize an audio library into folders by genre and mood.
 
-Genre comes from existing tags when present, otherwise from a rule-based
-guess built on top of tempo/percussiveness/timbre. Mood is always derived
-from the audio itself, using a simplified arousal/valence model (the same
-idea used in music-emotion-recognition research): tempo + loudness give the
-"energy" axis, brightness + harmonic-vs-percussive balance give the
-"positive/negative" axis. Thresholds for both axes are computed from the
-percentiles of the library being processed, so "high energy" means "high
-relative to your own collection", not some fixed number tuned on someone
-else's music.
+Genre comes from existing tags when present. For untagged tracks, pick a
+classifier with --classifier:
+  - heuristic (default): rule-based guess from tempo/percussiveness/timbre.
+    Not a trained model - DSP rules of thumb, useful for sorting but not
+    perfectly accurate for every track.
+  - clap-zeroshot: LAION-CLAP audio embeddings matched against text
+    descriptions of each genre. No training data needed. See genre_clap.py.
+  - clap-head: CLAP embeddings + a small classifier trained on your own
+    tagged tracks (train_genre_head.py). Most accurate once you have enough
+    tagged tracks to train from.
 
-None of this is a trained classifier - it's DSP heuristics. Expect it to be
-useful for sorting, not perfectly accurate for every track.
+Mood is always derived from the audio itself, using a simplified
+arousal/valence model (the same idea used in music-emotion-recognition
+research): tempo + loudness give the "energy" axis, brightness +
+harmonic-vs-percussive balance give the "positive/negative" axis. Thresholds
+for both axes are computed from the percentiles of the library being
+processed, so "high energy" means "high relative to your own collection",
+not some fixed number tuned on someone else's music.
 """
 
 from __future__ import annotations
@@ -211,8 +217,18 @@ def unique_destination(dest_dir: Path, filename: str) -> Path:
         counter += 1
 
 
-def classify_tracks(analyzed: list[TrackFeatures]) -> dict[str, tuple[str, str]]:
-    """Returns {path_str: (genre, mood)} using library-relative thresholds."""
+def classify_tracks(
+    analyzed: list[TrackFeatures], clap_predictions: dict[str, list[str]] | None = None
+) -> dict[str, tuple[str, str]]:
+    """Returns {path_str: (genre, mood)} using library-relative thresholds.
+
+    Genre priority: ID3 tag > CLAP prediction (if provided) > DSP heuristic.
+    A CLAP classifier can predict more than one genre per track (see
+    genre_clap.py) - the first one is used as the primary genre here, for
+    picking a single destination folder. The full set is logged separately
+    in main()'s CSV report.
+    """
+    clap_predictions = clap_predictions or {}
     valid = [f for f in analyzed if f.error is None]
 
     tempos = [f.tempo for f in valid]
@@ -234,7 +250,8 @@ def classify_tracks(analyzed: list[TrackFeatures]) -> dict[str, tuple[str, str]]
         valence_bucket = "low" if valence < 0.33 else "high" if valence > 0.66 else "medium"
         mood = MOOD_GRID[(arousal_bucket, valence_bucket)]
 
-        genre = f.tag_genre or guess_genre_from_features(f)
+        clap_genres = clap_predictions.get(str(f.path))
+        genre = f.tag_genre or (clap_genres[0] if clap_genres else None) or guess_genre_from_features(f)
         result[str(f.path)] = (genre, mood)
 
     return result
@@ -257,6 +274,15 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1, help="Parallel analysis workers")
     parser.add_argument("--extensions", default=",".join(sorted(DEFAULT_EXTENSIONS)), help="Comma-separated list of extensions to include")
     parser.add_argument("--log", default=None, help="CSV report path (default: <dest>/organize_log.csv)")
+    parser.add_argument(
+        "--classifier",
+        choices=["heuristic", "clap-zeroshot", "clap-head"],
+        default="heuristic",
+        help="Genre classifier for untagged tracks: DSP rules of thumb (default), "
+        "zero-shot CLAP, or a CLAP embedding + trained head (see train_genre_head.py)",
+    )
+    parser.add_argument("--clap-cache", default=".clap_cache.pkl", help="CLAP embedding cache file")
+    parser.add_argument("--clap-head", default="clap_genre_head.joblib", help="Trained head file (for --classifier clap-head)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -326,7 +352,35 @@ def main() -> int:
         if len(errors) > 10:
             log.warning("  ... and %d more", len(errors) - 10)
 
-    classification = classify_tracks(analyzed)
+    clap_predictions: dict[str, list[str]] = {}
+    if args.classifier != "heuristic":
+        import genre_clap
+
+        untagged = [str(f.path) for f in analyzed if f.tag_genre is None]
+        if untagged:
+            log.info(
+                "Running CLAP genre classification (%s) on %d untagged track(s)...",
+                args.classifier,
+                len(untagged),
+            )
+            embeddings = genre_clap.embed_files(untagged, cache_path=Path(args.clap_cache))
+            if args.classifier == "clap-zeroshot":
+                text_embeddings = genre_clap.get_text_embeddings(sorted(genre_clap.DEFAULT_PROMPTS))
+                clap_predictions = {
+                    p: genre_clap.zero_shot_genres(emb, text_embeddings) for p, emb in embeddings.items()
+                }
+            else:
+                head_path = Path(args.clap_head)
+                if not head_path.is_file():
+                    log.error(
+                        "No trained head at %s - run train_genre_head.py first, or use --classifier clap-zeroshot",
+                        head_path,
+                    )
+                    return 1
+                head = genre_clap.load_head(head_path)
+                clap_predictions = {p: genre_clap.predict_with_head(head, emb) for p, emb in embeddings.items()}
+
+    classification = classify_tracks(analyzed, clap_predictions)
 
     if not args.dry_run:
         dest.mkdir(parents=True, exist_ok=True)
@@ -337,10 +391,12 @@ def main() -> int:
         genre, mood = classification[str(f.path)]
         genre_dir = sanitize_name(genre)
         mood_dir = sanitize_name(mood)
+        all_genres = clap_predictions.get(str(f.path)) or [genre]
+        genres_field = ";".join(sanitize_name(g) for g in all_genres)
         target_dir = dest / genre_dir / mood_dir
 
         if args.dry_run:
-            rows.append((f.path, genre_dir, mood_dir, None, "dry-run"))
+            rows.append((f.path, genre_dir, genres_field, mood_dir, None, "dry-run"))
             continue
 
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -350,22 +406,24 @@ def main() -> int:
                 shutil.move(str(f.path), str(target_path))
             else:
                 shutil.copy2(str(f.path), str(target_path))
-            rows.append((f.path, genre_dir, mood_dir, target_path, "ok"))
+            rows.append((f.path, genre_dir, genres_field, mood_dir, target_path, "ok"))
         except Exception as exc:  # noqa: BLE001
-            rows.append((f.path, genre_dir, mood_dir, None, f"copy_failed: {exc}"))
+            rows.append((f.path, genre_dir, genres_field, mood_dir, None, f"copy_failed: {exc}"))
 
     for path, reason in errors:
-        rows.append((path, "", "", None, f"analysis_failed: {reason}"))
+        rows.append((path, "", "", "", None, f"analysis_failed: {reason}"))
 
     if not args.dry_run:
         with open(log_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["source_path", "genre", "mood", "dest_path", "status"])
-            for path, genre_dir, mood_dir, target_path, status in rows:
-                writer.writerow([str(path), genre_dir, mood_dir, str(target_path) if target_path else "", status])
+            writer.writerow(["source_path", "genre", "genres", "mood", "dest_path", "status"])
+            for path, genre_dir, genres_field, mood_dir, target_path, status in rows:
+                writer.writerow(
+                    [str(path), genre_dir, genres_field, mood_dir, str(target_path) if target_path else "", status]
+                )
         log.info("Log written to %s", log_path)
 
-    ok = sum(1 for r in rows if r[4] == "ok")
+    ok = sum(1 for r in rows if r[5] == "ok")
     log.info(
         "%s %d file(s)%s into %s",
         "Would move" if args.dry_run and args.move else "Would copy" if args.dry_run else ("Moved" if args.move else "Copied"),
@@ -377,7 +435,7 @@ def main() -> int:
     if args.dry_run:
         from collections import Counter
 
-        breakdown = Counter((g, m) for _, g, m, _, _ in rows)
+        breakdown = Counter((g, m) for _, g, _, m, _, _ in rows)
         for (g, m), count in sorted(breakdown.items()):
             log.info("  %s/%s: %d", g, m, count)
 
