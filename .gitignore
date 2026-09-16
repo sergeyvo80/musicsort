@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Project data (audio files and generated output)
+music/
+organized/
+
+# Claude Code / agentic tooling state
+.agentic/
