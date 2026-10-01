@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-log = logging.getLogger("organize_music.clap")
+log = logging.getLogger("musicsort.clap")
 
 # Default, human-readable prompts for the genre buckets GENRE_TAG_ALIASES
 # maps into. These just give zero-shot matching a better starting point -

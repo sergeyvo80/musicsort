@@ -273,7 +273,7 @@ def main() -> int:
     parser.add_argument("--duration", type=float, default=60.0, help="Seconds of audio to analyze per file (default: 60)")
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1, help="Parallel analysis workers")
     parser.add_argument("--extensions", default=",".join(sorted(DEFAULT_EXTENSIONS)), help="Comma-separated list of extensions to include")
-    parser.add_argument("--log", default=None, help="CSV report path (default: <dest>/organize_log.csv)")
+    parser.add_argument("--log", default=None, help="CSV report path (default: <dest>/musicsort_log.csv)")
     parser.add_argument(
         "--classifier",
         choices=["heuristic", "clap-zeroshot", "clap-head"],
@@ -286,12 +286,12 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    log = logging.getLogger("organize_music")
+    log = logging.getLogger("musicsort")
 
     source = Path(args.source).expanduser().resolve()
     dest = Path(args.dest).expanduser().resolve()
     extensions = {e if e.startswith(".") else f".{e}" for e in args.extensions.split(",") if e}
-    log_path = Path(args.log).expanduser().resolve() if args.log else dest / "organize_log.csv"
+    log_path = Path(args.log).expanduser().resolve() if args.log else dest / "musicsort_log.csv"
 
     if not source.is_dir():
         log.error("Source folder not found: %s", source)

@@ -25,7 +25,7 @@ import logging
 import random
 from pathlib import Path
 
-from organize_music import DEFAULT_EXTENSIONS, discover_files
+from musicsort import DEFAULT_EXTENSIONS, discover_files
 
 
 def main() -> int:

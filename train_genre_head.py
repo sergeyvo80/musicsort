@@ -8,12 +8,12 @@ just the ones GENRE_TAG_ALIASES knows about) just by labeling a few tracks
 with them.
 
 Ground truth normally comes for free from tracks that already carry a
-usable ID3 genre tag (mapped through organize_music.GENRE_TAG_ALIASES). If
+usable ID3 genre tag (mapped through musicsort.GENRE_TAG_ALIASES). If
 your library has few or none of those (common for libraries pulled from
 release-group/pirate sources, where the genre field is missing or stuffed
 with a promo URL), pass --labels-csv instead: a CSV with "path,genre"
 columns for a small hand-labeled sample (~20-30 tracks per genre is enough
-to start; see generate_label_template.py). Point organize_music.py at the
+to start; see generate_label_template.py). Point musicsort.py at the
 trained result with --classifier clap-head to classify the rest of the
 library.
 """
@@ -26,7 +26,7 @@ import logging
 from pathlib import Path
 
 import genre_clap
-from organize_music import DEFAULT_EXTENSIONS, discover_files, read_tag_genre, sanitize_name
+from musicsort import DEFAULT_EXTENSIONS, discover_files, read_tag_genre, sanitize_name
 
 
 def load_labels_from_csv(csv_path: Path) -> dict[str, list[str]]:
