@@ -1,5 +1,9 @@
 # musicsort — сортировка музыки по жанру и настроению
 
+> **Языки / Languages:** [🇷🇺 Русский](#ru) · [🇬🇧 English](#en)
+
+<a id="ru"></a>
+
 Утилита раскладывает аудиотеку `music/` в `sorted/`.
 
 **Ключевые свойства текущей версии:**
@@ -112,3 +116,124 @@ music/ (672 файла) → sorted/ (плоско): 37 жанровых папо
 * Первое использование CLAP скачивает чекпоинт ~2GB (+ roberta-base).
 * `.clap_cache.pkl`, `clap_genre_head.joblib`, `labels_template.csv`, `music/`, `organized/`, `sorted/` — в `.gitignore`.
 * Скрипты: `musicsort.py` (сортировка), `genre_clap.py` (эмбеддинги/zero-shot/голова), `train_genre_head.py` (обучение), `generate_label_template.py` (шаблон/автозаполнение).
+
+* * *
+
+<a id="en"></a>
+
+# musicsort — sort your music library by genre and mood
+
+> **Languages / Языки:** [🇷🇺 Русский](#ru) · [🇬🇧 English](#en)
+
+The utility organizes the audio library from `music/` into `sorted/`.
+
+**Key properties of the current version:**
+
+* **Flat structure**: genre folders and mood folders sit side by side on the same level — `sorted/techno/`, `sorted/mood_driving/`, etc. Mood folders carry a `mood_` prefix (`MOOD_FOLDER_PREFIX`) so they never collide with genres.
+* **Multi-placement**: one file lives in several folders at once — a copy in each of its genres (CLAP is multi-label) plus the mood folder.
+* **Wipe before writing**: before every real sorting run `sorted/` is cleared — the script prints a warning listing what will be removed and asks to confirm (`y`); `--yes` skips the prompt; anything other than `y` touches nothing. You cannot nuke the source: if dest equals `music/` or contains it, the run aborts with an error.
+* Genre comes from an ID3 tag or the CLAP classifier (cascade `tag > CLAP > heuristic`), mood comes from DSP analysis (arousal/valence percentiles of the collection).
+* The genre vocabulary is open: your genres go into `labels_template.csv`, and the model retrains with a single command (see below).
+
+## Installation
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt              # librosa, numpy, mutagen
+pip install -r requirements-clap.txt        # torch, laion-clap, sklearn, joblib — CLAP only
+```
+
+## Just sort it
+
+```bash
+.venv/bin/python musicsort.py --classifier clap-head --workers 8 --yes
+```
+
+What happens: DSP analysis of 672 files in ~5 minutes (8 workers) → CLAP classification instantly from the `.clap_cache.pkl` cache → wipe + write of `sorted/` (flat folder layout, log at `sorted/musicsort_log.csv`).
+
+* Without `--yes` the script shows what will be deleted and asks for confirmation.
+* To preview first, add `--dry-run` (prints the placement plan and per-folder breakdown).
+* The dry-run breakdown counts **flat folders** and already accounts for multi-placement.
+* Copying is the default (`--move` to move instead). Because of multi-placement, `--move` copies the file to all folders except the last one, which receives the move; the source is freed.
+* In the CSV log (`source_path, genre, genres, mood, dest_path, status`) all of a file's destinations are joined with `;` in `dest_path`; the `mood` column carries no prefix.
+* Change dest with `--dest <folder>` (everything above applies to it).
+
+## Genre classifier modes (`--classifier`)
+
+| Mode | What it predicts with | When to use |
+|---|---|---|
+| `heuristic` (default) | DSP rules over tempo/flatness/percussive_ratio | fast, no model, coarse buckets (`electronic`, `ambient`, ...) |
+| `clap-zeroshot` | track embedding vs genre text prompts | no training needed; thresholds: top <0.2 → `other`, z-score >1.0 (`genre_clap.py`) |
+| `clap-head` | CLAP + a head trained on your labels | the most accurate; requires `clap_genre_head.joblib` (see retraining) |
+
+Multi-label: a track gets every genre with probability ≥0.5; the first one is the "primary" in the log. The embedding cache is keyed by `(path, mtime, size)`: moving the library invalidates key matches and triggers a one-time recompute (~10–15 min), after which the cache is instant again.
+
+## Labeling (`labels_template.csv`)
+
+A CSV with `path,genre` columns; the genre cell may be left empty — it can be filled in later.
+
+### Generating a new template
+
+```bash
+.venv/bin/python generate_label_template.py --source music --out labels_template.csv --count 200 --seed 42
+# write genres in the genre column, multi-label with ';' — e.g. house;ambient
+```
+
+### Autofilling blank rows from classifier predictions
+
+```bash
+.venv/bin/python generate_label_template.py --fill-from-log sorted/musicsort_log.csv
+# Filled 156 blank genre cell(s) from .../musicsort_log.csv
+```
+
+Rules:
+
+* blank rows are filled with the classifier's full multi-label (`house;kolbasa;progressive;techno`) — every entry can be edited or removed later;
+* rows you filled yourself are **never overwritten**, and you can top up at any time between runs;
+* paths from the library's previous location are automatically remapped to the current one (by path tail / folder-and-filename match), so the CSV survives project relocation.
+
+## Retraining on your own data (step by step)
+
+**Step 1. Edit genres.** Open `labels_template.csv` and edit the `genre` column: multi-label with `;`, your own genres in any form (`hardstyle`, `russian_rock`). Editing alone does not retrain anything.
+
+**Step 2. Retrain the head.**
+
+```bash
+.venv/bin/python train_genre_head.py --labels-csv labels_template.csv --cache .clap_cache.pkl --out clap_genre_head.joblib
+```
+
+* the head (OneVsRest LogisticRegression over 512d CLAP embeddings) is trained **from scratch** on the current CSV contents and overwrites `clap_genre_head.joblib`; this takes seconds — embeddings come from the cache;
+* at least 20 labeled tracks are required (`Need at least 20`); genres with <5 examples get a warning and will predict poorly; for stable quality aim for ~20–30 tracks per genre;
+* an alternative label source is ID3 tags (`--source music` without `--labels-csv`), but this library has 0 usable tags.
+
+**Step 3. Restart sorting with the new model.**
+
+```bash
+.venv/bin/python musicsort.py --classifier clap-head --workers 8 --yes
+```
+
+`sorted/` is wiped and rewritten with the new predictions. CLAP is instant, DSP takes ~5 min.
+
+The full loop: edit the CSV → retrain (seconds) → restart (~5 min).
+
+## How mood is computed
+
+Always DSP, over the whole collection at once: `arousal = 0.5*percentile(tempo) + 0.5*percentile(rms)`, `valence = 0.5*percentile(centroid) + 0.5*(1−percentile(percussive_ratio))` → the 3×3 `MOOD_GRID` → 9 moods: melancholic, contemplative, peaceful, mysterious, atmospheric, uplifting, tension_building, driving, euphoric. Thresholds are relative — "high energy" means "high relative to your own collection".
+
+## Latest run result (current version)
+
+```
+music/ (672 files) → sorted/ (flat): 37 genre folders + 9 mood_* folders
+672/672 ok, 2367 folder placements, ~33GB (multi-copies)
+Top: techno 217, trance 209, mood_atmospheric 208, trance_classic 173, house 152
+Log: sorted/musicsort_log.csv
+```
+
+Historical runs before the redesign wrote to `organized/` with the nested `<genre>/<mood>` layout.
+
+## Notes
+
+* `Warning: Xing stream size off by more than 1%` — a broken mp3 header, ignored.
+* First CLAP use downloads a ~2GB checkpoint (+ roberta-base).
+* `.clap_cache.pkl`, `clap_genre_head.joblib`, `labels_template.csv`, `music/`, `organized/`, `sorted/` are in `.gitignore`.
+* Scripts: `musicsort.py` (sorting), `genre_clap.py` (embeddings/zero-shot/head), `train_genre_head.py` (training), `generate_label_template.py` (template/autofill).
