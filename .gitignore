@@ -12,6 +12,8 @@ env/
 # Project data (audio files and generated output)
 music/
 organized/
+sorted/
+corted/
 
 # Claude Code / agentic tooling state
 .agentic/

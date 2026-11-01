@@ -20,6 +20,14 @@ harmonic-vs-percussive balance give the "positive/negative" axis. Thresholds
 for both axes are computed from the percentiles of the library being
 processed, so "high energy" means "high relative to your own collection",
 not some fixed number tuned on someone else's music.
+
+Layout: the destination tree is flat - <dest>/<name> folders for every genre
+and every mood (mood folders carry a "mood_" prefix), side by side, one level
+deep. A track is placed in every genre folder it was assigned (CLAP can
+predict several) plus its mood folder, so one track may live in several
+folders at once. The destination folder is wiped clean before every real
+(non-dry-run) run - you get a warning and a confirmation prompt first, so
+stale copies from a previous layout can't linger.
 """
 
 from __future__ import annotations
@@ -77,6 +85,11 @@ MOOD_GRID = {
     ("high", "medium"): "driving",
     ("high", "high"): "euphoric",
 }
+
+# Mood folders get this prefix in the flat destination tree, so genre
+# folders (techno, ambient, ...) and mood folders (mood_driving, ...)
+# never collide and are visually distinguished at a glance.
+MOOD_FOLDER_PREFIX = "mood_"
 
 
 @dataclass
@@ -224,9 +237,9 @@ def classify_tracks(
 
     Genre priority: ID3 tag > CLAP prediction (if provided) > DSP heuristic.
     A CLAP classifier can predict more than one genre per track (see
-    genre_clap.py) - the first one is used as the primary genre here, for
-    picking a single destination folder. The full set is logged separately
-    in main()'s CSV report.
+    genre_clap.py) - the first one serves as the primary genre in the CSV
+    report, the full set is used for the flat destination layout and is also
+    logged in main()'s CSV report.
     """
     clap_predictions = clap_predictions or {}
     valid = [f for f in analyzed if f.error is None]
@@ -264,10 +277,58 @@ def format_eta(done: int, total: int, elapsed: float) -> str:
     return f"{remaining:5.0f}s"
 
 
+def list_dir_contents(dest: Path) -> list[Path]:
+    return sorted(dest.iterdir()) if dest.is_dir() else []
+
+
+def wipe_dest(dest: Path, source: Path, assume_yes: bool, log) -> bool:
+    """Clears the destination folder before a fresh sorting run, so stale
+    folders or copies from a previous layout can't linger. Warns and asks
+    for confirmation first (--yes skips the prompt); returns False without
+    touching anything on abort or failure. Refuses when wiping would take
+    out the source library (dest equal to or containing it).
+    """
+    if dest == source or source.is_relative_to(dest):
+        log.error("Refusing to wipe %s: it contains the source folder %s", dest, source)
+        return False
+
+    existing = list_dir_contents(dest)
+    if existing:
+        log.warning("Destination %s will be WIPED before writing:", dest)
+        log.warning("  %d item(s) will be deleted permanently, e.g.:", len(existing))
+        for entry in existing[:10]:
+            log.warning("    - %s", entry.name)
+        if len(existing) > 10:
+            log.warning("    ... and %d more", len(existing) - 10)
+        if not assume_yes:
+            answer = input("Proceed with wiping? Type y to continue, anything else to abort: ")
+            if answer.strip().lower() not in ("y", "yes"):
+                log.info("Aborted - destination left untouched.")
+                return False
+    else:
+        log.info("Destination %s is empty or does not exist yet - nothing to wipe.", dest)
+
+    deleted = 0
+    for entry in existing:
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            deleted += 1
+        except OSError as exc:
+            log.error("Failed to delete %s: %s - aborting to avoid a partial wipe", entry, exc)
+            return False
+    if deleted:
+        log.info("Wiped %d item(s) from %s", deleted, dest)
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="music", help="Folder with the source audio files (default: music)")
-    parser.add_argument("--dest", default="organized", help="Folder to write the sorted library into (default: organized)")
+    parser.add_argument("--dest", default="sorted", help="Folder to write the sorted library into (default: sorted). Wiped clean before a real run")
+    parser.add_argument("--yes", action="store_true", help="Skip the confirmation prompt when wiping the destination folder")
     parser.add_argument("--move", action="store_true", help="Move files instead of copying them")
     parser.add_argument("--dry-run", action="store_true", help="Analyze and print the plan, but don't touch any files")
     parser.add_argument("--duration", type=float, default=60.0, help="Seconds of audio to analyze per file (default: 60)")
@@ -382,62 +443,86 @@ def main() -> int:
 
     classification = classify_tracks(analyzed, clap_predictions)
 
+    if not args.dry_run and not wipe_dest(dest, source, args.yes, log):
+        return 1
+
     if not args.dry_run:
         dest.mkdir(parents=True, exist_ok=True)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows = []
+    rows: list[tuple[Path, str, str, str, list[str], list[Path], str]] = []
     for f in analyzed:
         genre, mood = classification[str(f.path)]
-        genre_dir = sanitize_name(genre)
-        mood_dir = sanitize_name(mood)
+        mood_dir = MOOD_FOLDER_PREFIX + sanitize_name(mood)
         all_genres = clap_predictions.get(str(f.path)) or [genre]
-        genres_field = ";".join(sanitize_name(g) for g in all_genres)
-        target_dir = dest / genre_dir / mood_dir
+        genre_dirs = list(dict.fromkeys(sanitize_name(g) for g in all_genres))
+        genres_field = ";".join(genre_dirs)
+
+        # Flat layout: every genre folder and the mood-prefixed mood folder
+        # sit directly under dest, so genres and mood are browsable on the
+        # same level. A multi-genre track gets one copy per genre on top of
+        # its mood copy.
+        target_names = genre_dirs + [mood_dir]
+        target_dirs = [dest / name for name in target_names]
 
         if args.dry_run:
-            rows.append((f.path, genre_dir, genres_field, mood_dir, None, "dry-run"))
+            rows.append((f.path, genre_dirs[0], genres_field, mood_dir, target_names, [], "dry-run"))
             continue
 
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = unique_destination(target_dir, f.path.name)
-        try:
-            if args.move:
-                shutil.move(str(f.path), str(target_path))
-            else:
-                shutil.copy2(str(f.path), str(target_path))
-            rows.append((f.path, genre_dir, genres_field, mood_dir, target_path, "ok"))
-        except Exception as exc:  # noqa: BLE001
-            rows.append((f.path, genre_dir, genres_field, mood_dir, None, f"copy_failed: {exc}"))
+        dest_paths: list[Path] = []
+        last_dir = target_dirs[-1]
+        try:  # noqa: BLE001
+            for target_dir in target_dirs:
+                # With several destinations plain --move can't happen for
+                # all of them: extras are copied, only the final one gets
+                # the move so the source ends up with a single remaining
+                # reference.
+                is_last = target_dir is last_dir
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_path = unique_destination(target_dir, f.path.name)
+                if args.move and is_last:
+                    shutil.move(str(f.path), str(target_path))
+                else:
+                    shutil.copy2(str(f.path), str(target_path))
+                dest_paths.append(target_path)
+            rows.append((f.path, genre_dirs[0], genres_field, mood_dir, target_names, dest_paths, "ok"))
+        except Exception as exc:
+            rows.append((f.path, genre_dirs[0], genres_field, mood_dir, target_names, dest_paths, f"copy_failed: {exc}"))
 
     for path, reason in errors:
-        rows.append((path, "", "", "", None, f"analysis_failed: {reason}"))
+        rows.append((path, "", "", "", [], [], f"analysis_failed: {reason}"))
+
+    ok = sum(1 for r in rows if r[6] == "ok")
+    placements = sum(len(r[5]) if r[6] == "ok" else len(r[4]) if r[6] == "dry-run" else 0 for r in rows)
 
     if not args.dry_run:
         with open(log_path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(["source_path", "genre", "genres", "mood", "dest_path", "status"])
-            for path, genre_dir, genres_field, mood_dir, target_path, status in rows:
+            for path, primary, genres_field, mood_dir, target_names, dest_paths, status in rows:
                 writer.writerow(
-                    [str(path), genre_dir, genres_field, mood_dir, str(target_path) if target_path else "", status]
+                    [str(path), primary, genres_field, mood_dir, ";".join(str(p) for p in dest_paths), status]
                 )
         log.info("Log written to %s", log_path)
 
-    ok = sum(1 for r in rows if r[5] == "ok")
     log.info(
-        "%s %d file(s)%s into %s",
+        "%s %d file(s)%s into %s (%d folder placements)",
         "Would move" if args.dry_run and args.move else "Would copy" if args.dry_run else ("Moved" if args.move else "Copied"),
         len(analyzed) if args.dry_run else ok,
         "" if not errors else f" ({len(errors)} skipped due to errors)",
         dest,
+        placements,
     )
 
     if args.dry_run:
         from collections import Counter
 
-        breakdown = Counter((g, m) for _, g, _, m, _, _ in rows)
-        for (g, m), count in sorted(breakdown.items()):
-            log.info("  %s/%s: %d", g, m, count)
+        breakdown = Counter()
+        for row in rows:
+            for name in row[4]:
+                breakdown[name] += 1
+        for name, count in sorted(breakdown.items()):
+            log.info("  %s: %d", name, count)
 
     return 0
 
