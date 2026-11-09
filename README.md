@@ -47,6 +47,55 @@ pip install -r requirements-clap.txt        # torch, laion-clap, sklearn, joblib
 
 Мультилейбл: трек получает все жанры с вероятностью ≥0.5, первый — «основной» в логе. Хэш-кэш эмбеддингов ведётся по `(path, mtime, size)`: переезд библиотеки обнуляет совпадения и вызывает одноразовый пересчёт (~10–15 мин), после чего кэш снова мгновенный.
 
+## Классификация до и после обучения
+
+Приоритет жанра всегда одинаков и не зависит от того, обучена ли голова: **ID3-тег → CLAP → эвристика**. Разница — то, что находится на шаге CLAP.
+
+### До обучения (файл `clap_genre_head.joblib` отсутствует)
+
+Первый прогон не требует обучения — работают два пути:
+
+**1. `--classifier heuristic` (дефолт — модель вообще не нужна).** `guess_genre_from_features` применяет фиксированные пороги к DSP-фичам каждого трека:
+
+| Условие | Жанр |
+|---|---|
+| tempo ≥ 118 **и** spectral flatness > 0.015 | `electronic` |
+| tempo ≤ 110 **и** percussive_ratio < 0.3 **и** flatness < 0.015 | `acoustic_classical` |
+| percussive_ratio > 0.35 **и** 75 ≤ tempo ≤ 160 **и** zcr > 0.09 **и** flatness > 0.02 | `rock_metal` |
+| tempo ≤ 100 **и** percussive_ratio > 0.3 **и** centroid < 2200 | `hiphop_beat` |
+| rms < 0.05 **и** tempo < 100 | `ambient` |
+| ничего не подошло | `other` |
+
+Правила «на глазок», не модель (комментарий в коде честно это оговаривает: four-on-the-floor электроника из-за синтезаторовых пэдов HPSS считает «гармоничной», поэтому flatness — лучший признак электроники, а не percussive_ratio).
+
+**2. `--classifier clap-zeroshot` (без обучения, но с моделью CLAP).**
+
+1. Аудио → эмбеддинг 512d (LAION-CLAP HTSAT-tiny), кэшируется в `.clap_cache.pkl`.
+2. CLAP сравнивает его по косинусной близости с текстовыми эмбеддингами промптов жанров (`DEFAULT_PROMPTS` в `genre_clap.py`): `electronic` → *"electronic dance music, house, techno or trance"*, `hiphop_beat` → *"hip hop or rap music"* и т.д.
+3. Двухчастный фильтр вместо фиксированного порога: если верхняя близость < **0.2** → треку ставится `other` (ни один жанр словаря не подходит); остальные жанры включаются в мультилейбл, только если их z-score относительно средней похожести этого трека ≥ **1.0** — это отсекает "не худший, но и не стоящий" варианты.
+
+**3. `--classifier clap-head` без файла головы** — корректно завершится ошибкой `No trained head at ... - run train_genre_head.py first, or use --classifier clap-zeroshot` и вернёт код 1. Это и есть точка, где нужно обучение из раздела «Переобучение».
+
+Настроение во всех этих режимах считается одинаково и независимо от жанровой ветки (см. «Как считается настроение»).
+
+### После обучения
+
+**`--classifier clap-head`:**
+
+1. Эмбеддинг трека (те же 512d, тот же кэш) подаётся в голову.
+2. Голова — **OneVsRest LogisticRegression**: по одному бинарному классификатору на жанр; каждый выдаёт вероятность «трек относится к жанру X».
+3. Жанры с вероятностью ≥ **0.5** (`HEAD_PROBABILITY_THRESHOLD`) становятся аудио-мультилейблом трека; если ни один не дотянул — берётся argmax (самая вероятная) как основной жанр.
+4. Дальше всё как всегда: каскад (теги перекрывают CLAP), плоские папки по каждому жанру + `mood_*`, CSV-лог.
+
+Ключевое отличие режимов: zero-shot сравнивает эмбеддинг с *текстовыми описаниями* жанров, head — с *границами, выученными на твоих примерах*. Отсюда и качество: head понимает твои специфичные классы (`kolbasa`, `trance_classic`), zero-shot — только то, что умеет описывать текстом.
+
+### Где хранится дообученная модель
+
+* **`clap_genre_head.joblib` в корне проекта** — дефолт для `--out` в `train_genre_head.py` и для `--clap-head` в `musicsort.py`. Переобучение **перезаписывает файл целиком** — голова каждый раз учится с нуля, инкрементального «дообучения поверх» нет.
+* Внутри joblib — словарь `{"classifier": OneVsRestClassifier(...), "binarizer": MultiLabelBinarizer()}`; список жанров хранится в `binarizer.classes_` (открытый словарь из CSV — сколько жанров вметили, столько классов).
+* Положение можно поменять: `--out путь/файл` при обучении и `--clap-head путь/файл` при сортировке.
+* Эмбеддинги лежат отдельно в `.clap_cache.pkl` и при переобучении **не пересчитываются** — переобучать голову можно сколько угодно часто и дёшево.
+
 ## Разметка (`labels_template.csv`)
 
 CSV с колонками `path,genre`; жанр можно оставить пустым — тогда его можно дозаполнить.
@@ -167,6 +216,55 @@ What happens: DSP analysis of 672 files in ~5 minutes (8 workers) → CLAP class
 | `clap-head` | CLAP + a head trained on your labels | the most accurate; requires `clap_genre_head.joblib` (see retraining) |
 
 Multi-label: a track gets every genre with probability ≥0.5; the first one is the "primary" in the log. The embedding cache is keyed by `(path, mtime, size)`: moving the library invalidates key matches and triggers a one-time recompute (~10–15 min), after which the cache is instant again.
+
+## Classification before and after training
+
+The genre priority is always the same and does not depend on whether a head is trained: **ID3 tag → CLAP → heuristic**. The difference is what happens at the CLAP step.
+
+### Before training (no `clap_genre_head.joblib` file)
+
+The first run requires no training — two paths work:
+
+**1. `--classifier heuristic` (default — no model needed at all).** `guess_genre_from_features` applies fixed thresholds to each track's DSP features:
+
+| Condition | Genre |
+|---|---|
+| tempo ≥ 118 **and** spectral flatness > 0.015 | `electronic` |
+| tempo ≤ 110 **and** percussive_ratio < 0.3 **and** flatness < 0.015 | `acoustic_classical` |
+| percussive_ratio > 0.35 **and** 75 ≤ tempo ≤ 160 **and** zcr > 0.09 **and** flatness > 0.02 | `rock_metal` |
+| tempo ≤ 100 **and** percussive_ratio > 0.3 **and** centroid < 2200 | `hiphop_beat` |
+| rms < 0.05 **and** tempo < 100 | `ambient` |
+| nothing fits | `other` |
+
+These are rules of thumb, not a model (the code comment says this honestly: four-on-the-floor electronics uses sustained synth pads, so HPSS scores it "harmonic" — flatness is the better electronic signal, not percussive_ratio).
+
+**2. `--classifier clap-zeroshot` (no training, but uses the CLAP model).**
+
+1. Audio → 512d embedding (LAION-CLAP HTSAT-tiny), cached in `.clap_cache.pkl`.
+2. CLAP compares it by cosine similarity against text embeddings of the genre prompts (`DEFAULT_PROMPTS` in `genre_clap.py`): `electronic` → *"electronic dance music, house, techno or trance"*, `hiphop_beat` → *"hip hop or rap music"*, etc.
+3. A two-part filter instead of a fixed threshold: if the top similarity < **0.2** → the track is labeled `other` (no vocabulary genre fits); other genres only join the multi-label if their z-score relative to that track's mean similarity ≥ **1.0** — this rejects options that are "not the worst but not standing out either".
+
+**3. `--classifier clap-head` without a head file** — fails cleanly with `No trained head at ... - run train_genre_head.py first, or use --classifier clap-zeroshot` and exit code 1. This is exactly the point where the "Retraining" section comes in.
+
+Mood is computed the same way in all of these modes and independently of the genre branch (see "How mood is computed").
+
+### After training
+
+**`--classifier clap-head`:**
+
+1. The track's embedding (the same 512d, the same cache) is fed into the head.
+2. The head is a **OneVsRest LogisticRegression**: one binary classifier per genre; each outputs a probability "this track belongs to genre X".
+3. Genres with probability ≥ **0.5** (`HEAD_PROBABILITY_THRESHOLD`) become the track's multi-label; if none reaches it, the argmax (most probable) genre is used as primary.
+4. From there the usual cascade applies (tags override CLAP), flat folders per genre + `mood_*`, CSV log.
+
+The key difference between the modes: zero-shot compares the embedding with *text descriptions* of genres, the head compares it with *decision boundaries learned from your examples*. That's where quality comes from: the head understands your specific classes (`kolbasa`, `trance_classic`), zero-shot only knows what it can describe in text.
+
+### Where the retrained model is stored
+
+* **`clap_genre_head.joblib` in the project root** — the default for `--out` in `train_genre_head.py` and for `--clap-head` in `musicsort.py`. Retraining **overwrites the file entirely** — the head is trained from scratch every time; there is no incremental "fine-tuning on top".
+* Inside the joblib there is a dict `{"classifier": OneVsRestClassifier(...), "binarizer": MultiLabelBinarizer()}`; the genre list lives in `binarizer.classes_` (an open vocabulary from the CSV — as many genres as you labeled, that many classes).
+* The location is configurable: `--out path/file` when training and `--clap-head path/file` when sorting.
+* Embeddings live separately in `.clap_cache.pkl` and are **not recomputed** on retraining — you can retrain the head as often as you like, cheaply.
 
 ## Labeling (`labels_template.csv`)
 
